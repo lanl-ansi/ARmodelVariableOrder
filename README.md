@@ -8,3 +8,6 @@ The main scripts used to generate the results reported in the paper are listed b
 - **Learning and Sampling for D-Wave**: produces the results for the D-Wave dataset experiments.
 
 All other files contain auxiliary functions and utilities that are called by these main scripts.
+
+**License
+This code is provided under a BSD license as part of the Optimization, Inference and Learning for Advanced Networks project, C18014.
