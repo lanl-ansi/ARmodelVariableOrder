@@ -15,7 +15,7 @@ This code is provided under a BSD license as part of the Optimization, Inference
 **Reference**
 The code presented here is part of the following work: 
 <script type="text/plain" class="bibtex">
-@article{biswal2026selecting,
+  @article{biswal2026selecting,
   title={Selecting Optimal Variable Order in Autoregressive Ising Models},
   author={Biswal, Shiba and Vuffray, Marc and Lokhov, Andrey Y},
   journal={arXiv preprint arXiv:2602.20394},
