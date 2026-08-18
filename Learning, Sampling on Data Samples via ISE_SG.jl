@@ -7,8 +7,9 @@ using Plots
 include("Graph Topology.jl")
 include("ISE Optimization.jl")
 include("Probabilities, Moments.jl")
-include("Generate_Training_Samples_Learning_Error.jl")
 include("Generate_Test_Samples_Sampling_Error.jl")
+include("Generate_Training_Samples_Learning_Error.jl")
+
 
 # --- Number of vertices ---
 N = 25
@@ -17,6 +18,7 @@ L = Int(sqrt(N))
 
 beta = 0.6
 beta_tag = replace(string(beta), "." => "")
+# beta_tag = replace(string(beta), ".0" => "")
 
 # --- Range of data and generated samples ---
 Ml_range = [500, 1000, 5000, 10_000]
@@ -29,7 +31,6 @@ T = 10
 
 # --- Define graph topology ---
 edges = generate_lattice_graph(L, L)
-edge_weights = ones(length(edges))
 
 # --- Define sequences ---
 seq = collect(1:N)
@@ -84,11 +85,14 @@ metrics = (
     :model_tv_error,
     :forward_kl_error,
     :reverse_kl_error,
+    :pairmoment_rmse,
     :sample_tv_error,
     :total_kl_error,
     :magnetization_error,
+    :overlap_tv_error,
 )
 
+# ---- Store solutions and results ---
 solutions = Dict(
     ml => Dict(
         key => Vector{Dict{Int,Vector{Float64}}}(undef, T)
@@ -129,32 +133,40 @@ results = Dict(
     ),
 )
 
-
-# --- Load a set of training samples ---
-fname2 = "Autoregressive Models/Data/5x5/Samples_5x5_M=200K_Ferro_beta=$(beta_tag).csv"
+# --- Load set of training samples ---
+fname2 = "Autoregressive Models/Data/5x5/Samples_5x5_M=200K_SpinGlass_beta=$(beta_tag).csv"
 data_samples = Int64.(readdlm(fname2, ','))
 
-# --- Load true moments to compare ---
-fname1 = "Autoregressive Models/Data/5x5/Data_5x5_Ferro_beta=$(beta_tag).h5"
-p_unnorm, norm_const, mean_true, cov_true = h5open(fname1, "r") do f
-    return (
-        read(f["p_unnorm"]),
-        read(f["norm_const"]),
-        read(f["mean_true"]),
-        read(f["cov_true"])
-    )
-end
-p_true = deepcopy(p_unnorm)
-p_true ./= Float64(norm_const)   # modifies p_unnorm
-logp_true = log.(p_true)
+# ---------- Precompute reference distributions for each t ----------
+overlap_prob_true_by_t = Vector{Vector{Float64}}(undef, T)
+mag_prob_true_by_t = Vector{Vector{Float64}}(undef, T)
 
-# --- Towards computing magnetization error ---
-mag_prob_true = zeros(Float64, N + 1)
+for t in 1:T
+    # Overlap reference
+    reference_samples = data_samples[(10_001+20_000*(t-1)):(20_000+20_000*(t-1)), :]
+    overlap_prob_true_by_t[t] = overlap_distribution(reference_samples)
 
-for state_idx in eachindex(p_true)
-    sigma = index_to_configuration(state_idx - 1, N)
-    nplus = count(==(1), sigma)
-    mag_prob_true[nplus+1] += p_true[state_idx]
+    # Exact magnetization reference
+    fname1 = "Autoregressive Models/Data/5x5/Data_5x5_SpinGlass_beta=$(beta_tag)_t$(t).h5"
+
+    p_unnorm, norm_const = h5open(fname1, "r") do f
+        return (
+            read(f["p_unnorm"]),
+            read(f["norm_const"])
+        )
+    end
+
+    p_true = Float64.(p_unnorm) ./ Float64(norm_const)
+
+    mag_prob_true = zeros(Float64, N + 1)
+
+    for state_idx in eachindex(p_true)
+        sigma = index_to_configuration(state_idx - 1, N)
+        nplus = count(==(1), sigma)
+        mag_prob_true[nplus+1] += p_true[state_idx]
+    end
+
+    mag_prob_true_by_t[t] = mag_prob_true
 end
 
 
@@ -164,11 +176,30 @@ for (j, ml) in enumerate(Ml_range)
         seed = 10_000 * j + t
 
         # --- Training Samples ---
-        train_samples = compress_samples(data_samples[((t-1)*ml+1):(t*ml), :]) #histogram
+        train_samples = compress_samples(data_samples[(20_000*(t-1)+1):(20_000*(t-1)+ml), :]) #histogram
 
         if sum(train_samples[:, 1]) != ml
             throw(ArgumentError("train_samples does not contain ml samples"))
         end
+
+        # --- Load true moments for some error computations ---
+        fname1 = "Autoregressive Models/Data/5x5/Data_5x5_SpinGlass_beta=$(beta_tag)_t$(t).h5"
+        edge_weights, p_unnorm, norm_const, mean_true, cov_true = h5open(fname1, "r") do f
+            return (
+                read(f["edge_weights"]),
+                read(f["p_unnorm"]),
+                read(f["norm_const"]),
+                read(f["mean_true"]),
+                read(f["cov_true"])
+            )
+        end
+        p_true = deepcopy(p_unnorm)
+        p_true ./= Float64(norm_const)
+        logp_true = log.(p_true)
+
+        # --- Towards magnetization and overlap error ---
+        mag_prob_true = mag_prob_true_by_t[t]
+        overlap_prob_true = overlap_prob_true_by_t[t]
 
         # --- Learn & Sample ---
         for key in ordering_keys
@@ -185,19 +216,21 @@ for (j, ml) in enumerate(Ml_range)
             # ---------
             rng_model = MersenneTwister(seed)
 
+            # --- sampling errors ---
             sampling_errors = finite_sampling_errors(
                 model.seq, model.param, sol_dict, Ms,
                 mean_true, cov_true, # First moments / pair correlations
-                p_true;  # TV and KL
-                mag_prob_true=mag_prob_true, # Magnetization TV
+                p_true; # TV and KL
+                mag_prob_true=nothing, # Magnetization TV
+                overlap_prob_true=nothing,
                 rng=rng_model,
                 compute_moment=false,
                 compute_mean_rmse=false,
                 compute_paircorr=false,
                 compute_tv=false,
                 compute_sampling_kl=false,
-                compute_total_kl=false,
-                compute_magnetization=true,
+                compute_total_kl=true,
+                compute_magnetization=false,
                 compute_overlap=false,
             )
 
@@ -205,52 +238,53 @@ for (j, ml) in enumerate(Ml_range)
                 model_tv_error=learning_errors.tv_error,
                 forward_kl_error=learning_errors.forward_kl_error,
                 reverse_kl_error=learning_errors.reverse_kl_error,
-                sample_tv_error=sampling_errors.tv_error,
                 mean_rmse=sampling_errors.mean_rmse,
                 pairmoment_rmse=sampling_errors.paircorr_error,
-                magnetization_error=sampling_errors.magnetization_tv_error,
+                sample_tv_error=sampling_errors.tv_error,
                 sampling_kl_error=sampling_errors.sampling_kl_error,
                 total_kl_error=sampling_errors.total_kl_error,
+                magnetization_error=sampling_errors.magnetization_tv_error,
+                overlap_tv_error=sampling_errors.overlap_tv_error,
             )
 
             for metric in metrics
-                value = getproperty(errors, metric)
-                !ismissing(value) && (results[:trial_errors][key][metric][j, t] = value)
+                results[:trial_errors][key][metric][j, t] = getproperty(errors, metric)
             end
 
-            results[:trial_errors][key][:magnetization_error][j, t] =
-                sampling_errors.magnetization_tv_error
-
-            println("Learning and Sampling error done for t=$(t) and ml=$(ml)")
+            println("Learning Sampling error done for t=$(t) and ml=$(ml)")
         end
 
     end
 
     for key in ordering_keys
-        for metric in metrics
-            trial_values = @view results[:trial_errors][key][metric][j, :]
+        for metric in sampling_metrics
+            trial_values =
+                @view results[:trial_errors][key][metric][j, :]
 
-            if all(isfinite, trial_values)
-                results[:summary][:mean][key][metric][j] = mean(trial_values)
-                results[:summary][:std][key][metric][j] = std(trial_values)
-            end
+            results[:summary][:mean][key][metric][j] =
+                mean(trial_values)
+
+            results[:summary][:std][key][metric][j] =
+                std(trial_values)
         end
     end
-
 end
 
 # ---- SAVE ---
-fname5 = joinpath("Autoregressive Models/Results/5x5", "results_5x5_ferro_beta=$(beta_tag)_updated.jld2")
+fname5 = joinpath("Autoregressive Models/Results/5x5", "results_5x5_SpinGlass_beta=$(beta_tag)_updated.jld2")
 
 jldsave(
     fname5;
     beta=beta,
     Ml_range=Ml_range,
+    Ms=Ms,
+    T=T,
     ordering_keys=ordering_keys,
     metrics=metrics,
     solutions=solutions,
     results=results,
 )
+
 
 # ==========================
 #      Post-Processing
@@ -292,8 +326,8 @@ function plot_all_errors(
             plot!(
                 Pmetric,
                 ml_range,
-                mean_errors[key][metric][1:length(ml_range)];
-                yerror=std_errors[key][metric][1:length(ml_range)],
+                mean_errors[key][metric][1:length(plot_Ml_range)];
+                yerror=std_errors[key][metric][1:length(plot_Ml_range)],
                 color=colors[model_index],
                 errorcolor=colors[model_index],
                 marker=markers[model_index],
@@ -310,7 +344,7 @@ function plot_all_errors(
     return plot(
         panels...;
         layout=(2, 3),
-        size=(1500, 800),
+        size=(1500, 800), # 1500,1200 for 3x3, 1500,800 for 2,3
         left_margin=12Plots.mm,
         right_margin=6Plots.mm,
         bottom_margin=8Plots.mm,
@@ -324,8 +358,10 @@ const METRIC_LABELS = Dict(
     :forward_kl_error => L"D_{\mathrm{KL}}(p\Vert q_\theta)",
     :reverse_kl_error => L"D_{\mathrm{KL}}(q_\theta\Vert p)",
     :sample_tv_error => L"\mathrm{TV}(p,\widehat q_{M_s})",
+    # :pairmoment_rmse => L"\mathrm{RMSE}_{\mathrm{pair}}",
     :total_kl_error => L"D_{\mathrm{KL}}(\widehat q_{M_s}\Vert p)",
     :magnetization_error => L"\mathrm{TV}\!\left(P_p(m),\widehat{P}_{M_s}(m)\right)",
+    # :overlap_tv_error => L"\mathrm{TV}\!\left(P_p(q),P_{q_\theta}(q)\right)",
 )
 
 const METRIC_TITLES = Dict(
@@ -333,8 +369,11 @@ const METRIC_TITLES = Dict(
     :forward_kl_error => "Exact forward KL",
     :reverse_kl_error => "Exact reverse KL",
     :sample_tv_error => "Finite-sample TV",
+    # :pairmoment_rmse => "Pair-moment RMSE",
     :total_kl_error => "Total KL",
-    :magnetization_error => "Magnetization-distribution TV",)
+    :magnetization_error => "Magnetization-distribution TV",
+    # :overlap_tv_error => "Replica-overlap TV",
+)
 
 plot_Ml_range = [500, 1000, 5000, 10_000]
 
@@ -343,8 +382,10 @@ plot_metrics = (
     :forward_kl_error,
     :reverse_kl_error,
     :sample_tv_error,
+    # :pairmoment_rmse,
     :total_kl_error,
     :magnetization_error,
+    # :overlap_tv_error,
 )
 
 P = plot_all_errors(
